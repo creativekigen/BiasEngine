@@ -17,6 +17,7 @@ from data.seed_data import demo_currency, demo_market, demo_catalysts
 from data_sources.market_data import yahoo_history
 from data_sources.cftc import fetch_cot_positions
 from data_sources.yields import fetch_treasury_curve
+from data_sources.economic_data import fetch_bls_indicators
 from data.seed_data import yahoo_market
 from engine.scoring import analyze_all
 
@@ -53,6 +54,10 @@ def load_cot_data():
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_yield_data():
     return fetch_treasury_curve()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_economic_data():
+    return fetch_bls_indicators()
 
 
 def load_data(source: str):
@@ -193,6 +198,9 @@ def generic_page(page):
     if page == "Yield Dashboard":
         yield_page()
         return
+    if page == "Economic Calendar":
+        economic_page()
+        return
     if page == "COT & Positioning":
         positioning_page()
         return
@@ -225,6 +233,29 @@ def yield_page():
     chart = table.set_index("TENOR")[["YIELD (%)"]]
     st.line_chart(chart, height=300)
     st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+def economic_page():
+    """Display latest official BLS CPI and labor observations."""
+    events = load_economic_data()
+    if not events:
+        st.warning("The BLS economic data service is unavailable. Refresh later to retry the public endpoint.")
+        return
+    rows = []
+    for event in events:
+        change = event["change"]
+        rows.append({
+            "INDICATOR": event["event"],
+            "LATEST VALUE": event["value"],
+            "CHANGE": round(change, 2) if change is not None else "N/A",
+            "UNIT": event["unit"],
+            "PERIOD": event["period"],
+            "SOURCE": event["source"],
+        })
+    table = pd.DataFrame(rows)
+    st.markdown('<div class="panel"><b>U.S. ECONOMIC INDICATORS</b><br>CPI and labor observations from the U.S. Bureau of Labor Statistics public API. GDP requires a separate BEA data series and is not inferred here.</div>', unsafe_allow_html=True)
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption("BLS release values are official observations and are not investment advice. Release timing varies by series.")
 
 
 def positioning_page():
