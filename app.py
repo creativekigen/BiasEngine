@@ -15,6 +15,7 @@ from data.database import init_db, save_scores
 from data.models import CURRENCIES, PAIRS
 from data.seed_data import demo_currency, demo_market, demo_catalysts
 from data_sources.market_data import yahoo_history
+from data_sources.cftc import fetch_cot_positions
 from data.seed_data import yahoo_market
 from engine.scoring import analyze_all
 
@@ -43,6 +44,10 @@ div.stButton > button { border-radius:3px; border:1px solid var(--border); }
 @st.cache_data(ttl=300, show_spinner=False)
 def load_yahoo_market():
     return yahoo_market(PAIRS)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_cot_data():
+    return fetch_cot_positions(CURRENCIES)
 
 
 def load_data(source: str):
@@ -180,6 +185,9 @@ def pair_xray(pair):
 
 def generic_page(page):
     st.subheader(page.upper())
+    if page == "COT & Positioning":
+        positioning_page()
+        return
     st.markdown(f'<div class="panel"><b>{provider_name} PRICE DATA</b><br>Market prices and historical returns may come from Yahoo Finance. Economic forecasts, COT, retail positioning, central-bank repricing, and news remain N/A until a dedicated provider is connected.</div>', unsafe_allow_html=True)
     if page == "Catalyst Radar":
         st.dataframe(pd.DataFrame([{**c,"timestamp":c["timestamp"].strftime("%d %b %H:%M"),"freshness":"0-24h" if (datetime.utcnow()-c["timestamp"]).total_seconds()<86400 else "24-48h"} for c in catalysts]),use_container_width=True,hide_index=True)
@@ -189,6 +197,40 @@ def generic_page(page):
         performance_page()
     else:
         st.write("No connected provider for this view. Configure an API key in `.env` to replace demo inputs.")
+
+
+def positioning_page():
+    """Display public CFTC futures positioning without substituting demo values."""
+    positions = load_cot_data()
+    if not positions:
+        st.warning("CFTC did not return positioning data. Check the provider response and refresh later.")
+        return
+    rows = []
+    for currency in CURRENCIES:
+        position = positions.get(currency)
+        if not position:
+            continue
+        net = position["net_position"]
+        change = position["weekly_change"]
+        rows.append({
+            "CURRENCY": currency,
+            "NET POSITION": round(net),
+            "WEEKLY CHANGE": round(change),
+            "LONG CONTRACTS": round(position["long"]),
+            "SHORT CONTRACTS": round(position["short"]),
+            "BIAS": "LONG" if net > 0 else "SHORT" if net < 0 else "FLAT",
+            "REPORT DATE": position["report_date"],
+            "SOURCE": position["source"],
+        })
+    table = pd.DataFrame(rows)
+    st.markdown('<div class="panel"><b>INSTITUTIONAL POSITIONING</b><br>Non-commercial futures positioning from the CFTC weekly Commitments of Traders report. CFTC publishes this report weekly, usually Friday afternoon Eastern Time.</div>', unsafe_allow_html=True)
+    left, right = st.columns(2)
+    with left:
+        left.metric("CURRENCIES AVAILABLE", len(table))
+    with right:
+        right.metric("AVERAGE NET POSITION", f"{table['NET POSITION'].mean():,.0f}")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption("Retail sentiment from AAII/CBOE and macro series from BLS/FRED are not included until their respective provider pipelines are configured.")
 
 
 def performance_page():
