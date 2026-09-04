@@ -299,7 +299,7 @@ def correlation_page():
     st.dataframe(display, use_container_width=True, hide_index=True)
     matrix = table.pivot(index="PAIR", columns="ASSET", values=selected_window)
     st.subheader(f"{selected_window} CORRELATION MATRIX")
-    st.dataframe(matrix.style.background_gradient(cmap="RdYlGn", vmin=-1, vmax=1).format("{:.3f}"), use_container_width=True)
+    st.dataframe(matrix.round(3), use_container_width=True)
 
 
 def positioning_page():
