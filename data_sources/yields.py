@@ -5,6 +5,8 @@ from datetime import datetime
 from xml.etree import ElementTree
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 TREASURY_ENDPOINT = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
@@ -17,13 +19,19 @@ def _local_name(tag: str) -> str:
 
 def fetch_treasury_curve() -> dict:
     """Return the latest Treasury par curve and its previous observation."""
-    response = requests.get(
-        TREASURY_ENDPOINT,
-        params={"data": "daily_treasury_yield_curve", "field_tdr_date_value": datetime.utcnow().year},
-        timeout=15,
-    )
-    response.raise_for_status()
-    root = ElementTree.fromstring(response.content)
+    session = requests.Session()
+    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",))
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    try:
+        response = session.get(
+            TREASURY_ENDPOINT,
+            params={"data": "daily_treasury_yield_curve", "field_tdr_date_value": datetime.utcnow().year},
+            timeout=(5, 10),
+        )
+        response.raise_for_status()
+        root = ElementTree.fromstring(response.content)
+    except (requests.RequestException, ElementTree.ParseError):
+        return {}
     observations = []
     for entry in root.iter():
         if _local_name(entry.tag) != "entry":
