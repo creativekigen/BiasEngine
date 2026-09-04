@@ -16,6 +16,7 @@ from data.models import CURRENCIES, PAIRS
 from data.seed_data import demo_currency, demo_market, demo_catalysts
 from data_sources.market_data import yahoo_history
 from data_sources.cftc import fetch_cot_positions
+from data_sources.yields import fetch_treasury_curve
 from data.seed_data import yahoo_market
 from engine.scoring import analyze_all
 
@@ -48,6 +49,10 @@ def load_yahoo_market():
 @st.cache_data(ttl=300, show_spinner=False)
 def load_cot_data():
     return fetch_cot_positions(CURRENCIES)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_yield_data():
+    return fetch_treasury_curve()
 
 
 def load_data(source: str):
@@ -185,6 +190,9 @@ def pair_xray(pair):
 
 def generic_page(page):
     st.subheader(page.upper())
+    if page == "Yield Dashboard":
+        yield_page()
+        return
     if page == "COT & Positioning":
         positioning_page()
         return
@@ -197,6 +205,26 @@ def generic_page(page):
         performance_page()
     else:
         st.write("No connected provider for this view. Configure an API key in `.env` to replace demo inputs.")
+
+
+def yield_page():
+    """Display the latest public U.S. Treasury par yield curve."""
+    data = load_yield_data()
+    if not data:
+        st.warning("The U.S. Treasury yield curve is unavailable. Refresh later to retry the public endpoint.")
+        return
+    curve = data["curve"]
+    rows = [{"TENOR": tenor, "YIELD (%)": value, "DAILY CHANGE (bp)": round(data["change"].get(tenor, 0) * 100, 1)} for tenor, value in curve.items()]
+    table = pd.DataFrame(rows)
+    st.markdown(f'<div class="panel"><b>U.S. TREASURY PAR YIELD CURVE</b><br>Latest available observation: {data["date"]}. Source: {data["source"]}. Yields are rates, not directional signals by themselves.</div>', unsafe_allow_html=True)
+    short, long = st.columns(2)
+    with short:
+        short.metric("2Y YIELD", f"{curve.get('2Y', float('nan')):.2f}%")
+    with long:
+        long.metric("10Y-2Y SPREAD", f"{(curve.get('10Y', 0) - curve.get('2Y', 0)) * 100:+.1f} bp")
+    chart = table.set_index("TENOR")[["YIELD (%)"]]
+    st.line_chart(chart, height=300)
+    st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 def positioning_page():
