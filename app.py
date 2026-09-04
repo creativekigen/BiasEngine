@@ -14,7 +14,7 @@ from config import settings
 from data.database import init_db, save_scores
 from data.models import CURRENCIES, PAIRS
 from data.seed_data import demo_currency, demo_market, demo_catalysts
-from data_sources.market_data import yahoo_history
+from data_sources.market_data import yahoo_history, yahoo_correlation_prices
 from data_sources.cftc import fetch_cot_positions
 from data_sources.yields import fetch_treasury_curve
 from data_sources.economic_data import fetch_bls_indicators
@@ -58,6 +58,10 @@ def load_yield_data():
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_economic_data():
     return fetch_bls_indicators()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_correlation_prices():
+    return yahoo_correlation_prices(period="1y")
 
 
 def load_data(source: str):
@@ -201,6 +205,9 @@ def generic_page(page):
     if page == "Economic Calendar":
         economic_page()
         return
+    if page == "Correlations":
+        correlation_page()
+        return
     if page == "COT & Positioning":
         positioning_page()
         return
@@ -256,6 +263,43 @@ def economic_page():
     st.markdown('<div class="panel"><b>U.S. ECONOMIC INDICATORS</b><br>CPI and labor observations from the U.S. Bureau of Labor Statistics public API. GDP requires a separate BEA data series and is not inferred here.</div>', unsafe_allow_html=True)
     st.dataframe(table, use_container_width=True, hide_index=True)
     st.caption("BLS release values are official observations and are not investment advice. Release timing varies by series.")
+
+
+def correlation_page():
+    """Calculate Pearson correlations from Yahoo daily price returns."""
+    prices = load_correlation_prices()
+    benchmarks = ["GOLD", "WTI", "S&P 500"]
+    pairs = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"]
+    windows = {"1M": 21, "3M": 63, "1Y": 252}
+    if not prices:
+        st.warning("Yahoo Finance did not return price history. Refresh later to retry the correlation feed.")
+        return
+    rows = []
+    for pair in pairs:
+        if pair not in prices:
+            continue
+        for benchmark in benchmarks:
+            if benchmark not in prices:
+                continue
+            joined = pd.concat([prices[pair].rename("pair"), prices[benchmark].rename("benchmark")], axis=1).dropna()
+            returns = joined.pct_change().dropna()
+            row = {"PAIR": pair, "ASSET": benchmark, "OBSERVATIONS": len(returns)}
+            for label, window in windows.items():
+                sample = returns.tail(window)
+                row[label] = round(sample["pair"].corr(sample["benchmark"]), 3) if len(sample) >= max(20, window // 2) else None
+            rows.append(row)
+    table = pd.DataFrame(rows)
+    if table.empty:
+        st.warning("Insufficient overlapping Yahoo Finance history to calculate correlations.")
+        return
+    st.markdown('<div class="panel"><b>PRICE RETURN CORRELATIONS</b><br>Pearson correlation (r) calculated from aligned Yahoo Finance daily closing prices and percentage returns. Values near +1 move together; values near -1 move in opposite directions. Correlation is descriptive, not causal.</div>', unsafe_allow_html=True)
+    st.caption("Raw feed: Yahoo Finance daily prices | Assets: Gold futures (GC=F), WTI futures (CL=F), and S&P 500 (^GSPC)")
+    selected_window = st.selectbox("TIMEFRAME", list(windows), index=1)
+    display = table[["PAIR", "ASSET", selected_window, "OBSERVATIONS"]].rename(columns={selected_window: "CORRELATION (r)"})
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    matrix = table.pivot(index="PAIR", columns="ASSET", values=selected_window)
+    st.subheader(f"{selected_window} CORRELATION MATRIX")
+    st.dataframe(matrix.style.background_gradient(cmap="RdYlGn", vmin=-1, vmax=1).format("{:.3f}"), use_container_width=True)
 
 
 def positioning_page():
