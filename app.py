@@ -205,6 +205,7 @@ SOURCE_WATCHLIST = {
     "CNBC": "https://www.cnbc.com/2026/09/07/japan-foreign-reserves-yen-intervention.html",
     "The Japan Times": "https://www.japantimes.co.jp/business/2026/09/07/markets/japan-treasuries-sell-for-yen/",
     "Forex Factory": "https://www.forexfactory.com/news/1416690-yen-climbs-to-highest-level-since-may-exceeding",
+    "FXStreet": "https://www.fxstreet.com/analysis/jpy-pairs-selling-resumes-usd-jpy-152-eur-jpy-178-and-gbp-jpy-207-next-video-202609070907",
 }
 
 
