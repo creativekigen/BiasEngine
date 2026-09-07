@@ -3,6 +3,9 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
+import requests
 sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
@@ -173,6 +176,8 @@ def load_data(source: str):
 
 
 data_source = "Demo Mode"
+if "selected_pair" not in st.session_state:
+    st.session_state.selected_pair = None
 if "data_source" not in st.session_state:
     st.session_state.data_source = "Yahoo Finance"
 data_source = st.session_state.data_source
@@ -192,6 +197,121 @@ def regime():
     score = (equity * 1.4) + (btc * .3) - ((vix - 18) * .2)
     label = "RISK ON" if score > .3 else "RISK OFF" if score < -.3 else "MIXED"
     return label, max(51, min(88, int(64 + score * 8)))
+
+
+FEATURED_NEWS = {
+    "JPY": {
+        "title": "JPY pairs selling resumes - USD/JPY 152, EUR/JPY 178 and GBP/JPY 207 next?",
+        "url": "https://www.fxstreet.com/analysis/jpy-pairs-selling-resumes-usd-jpy-152-eur-jpy-178-and-gbp-jpy-207-next-video-202609070907",
+        "source": "FXStreet",
+        "note": "Use this as a JPY-cross context article, not as proof of every JPY pair's direction.",
+    }
+}
+
+
+def currency_score(currency):
+    values = currencies.get(currency, {})
+    return float(values.get("structural", 0)) * .30 + float(values.get("repricing", 0)) * .40 + float(values.get("flow", 0)) * .30
+
+
+def pair_currencies(pair):
+    return (pair[:3], pair[3:]) if len(pair) == 6 else (pair[:3], pair[-3:])
+
+
+def signed_pair_score(analysis):
+    if analysis.action == "BUY":
+        return float(analysis.score)
+    if analysis.action == "SELL":
+        return -float(analysis.score)
+    return 0.0
+
+
+def factor_rows(analysis):
+    rows = []
+    for name, raw_value in analysis.factors.items():
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if analysis.action == "BUY":
+            status = "CONFIRMS" if value > .25 else "CONFLICTS" if value < -.25 else "NEUTRAL"
+        elif analysis.action == "SELL":
+            status = "CONFIRMS" if value < -.25 else "CONFLICTS" if value > .25 else "NEUTRAL"
+        else:
+            status = "NEUTRAL"
+        rows.append((name.replace("_", " ").title(), value, status))
+    return sorted(rows, key=lambda row: abs(row[1]), reverse=True)
+
+
+def build_why_trade(analysis):
+    base, quote = pair_currencies(analysis.pair)
+    base_score = currency_score(base)
+    quote_score = currency_score(quote)
+    rows = factor_rows(analysis)
+    confirming = [row for row in rows if row[2] == "CONFIRMS"][:4]
+    conflicts = [row for row in rows if row[2] == "CONFLICTS"][:2]
+    if analysis.action == "BUY":
+        direction = f"{base} is stronger than {quote} on the currency-engine composite ({base_score:+.2f} vs {quote_score:+.2f})."
+    elif analysis.action == "SELL":
+        direction = f"{quote} is stronger than {base} on the currency-engine composite ({quote_score:+.2f} vs {base_score:+.2f})."
+    else:
+        direction = f"The currency edge is not decisive ({base} {base_score:+.2f} vs {quote} {quote_score:+.2f})."
+    bullets = [direction]
+    bullets.extend(f"{name} is confirming the {analysis.action.lower()} thesis ({value:+.2f})." for name, value, _ in confirming)
+    if analysis.alignment:
+        bullets.append(f"Model alignment is {analysis.alignment}/9, so the signal has {analysis.alignment} supporting checks.")
+    if conflicts:
+        bullets.append("The main conflict is " + "; ".join(f"{name} ({value:+.2f})" for name, value, _ in conflicts) + ".")
+    verdict = "HIGH CONVICTION" if analysis.confidence >= 70 and analysis.alignment >= 4 else "MODERATE CONVICTION" if analysis.confidence >= 55 else "LOW CONVICTION"
+    return {"base": base, "quote": quote, "base_score": base_score, "quote_score": quote_score, "edge": base_score - quote_score, "bullets": bullets, "verdict": verdict}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_pair_news(pair, action):
+    base, quote = pair_currencies(pair)
+    query = quote_plus(f"{pair} OR {base} {quote} forex")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        response = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        items = []
+        for item in root.findall(".//item")[:15]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            source_node = item.find("source")
+            source = (source_node.text or "Unknown") if source_node is not None else "Unknown"
+            published = (item.findtext("pubDate") or "").strip()
+            if not title or not link:
+                continue
+            lower_title = title.lower()
+            positive = sum(term in lower_title for term in ["bullish", "higher", "strengthen", "gains", "rises", "support", "buy", "hawkish", "surge"])
+            negative = sum(term in lower_title for term in ["bearish", "lower", "weaken", "falls", "drops", "sell", "dovish", "decline"])
+            if action == "BUY":
+                stance = "CONFIRMS" if positive > negative else "CONFLICTS" if negative > positive else "MIXED"
+            elif action == "SELL":
+                stance = "CONFIRMS" if negative > positive else "CONFLICTS" if positive > negative else "MIXED"
+            else:
+                stance = "MIXED"
+            items.append({"title": title, "link": link, "source": source, "published": published, "stance": stance})
+        return items
+    except (requests.RequestException, ET.ParseError) as error:
+        return [{"title": "News feed unavailable", "link": "", "source": "System", "published": "", "stance": "MIXED", "error": str(error)}]
+
+
+def render_news(analysis):
+    st.markdown("#### Bias-aware news radar")
+    st.caption("News is contextual evidence. The engine does not force every article to agree with the model signal.")
+    base, quote = pair_currencies(analysis.pair)
+    if quote == "JPY" or base == "JPY":
+        featured = FEATURED_NEWS["JPY"]
+        st.markdown(f'<div class="panel"><b>Featured JPY-cross context</b><br><a href="{featured["url"]}" target="_blank">{featured["title"]}</a><br><span class="small">{featured["source"]} · {featured["note"]}</span></div>', unsafe_allow_html=True)
+    for item in fetch_pair_news(analysis.pair, analysis.action)[:8]:
+        cls = "positive" if item["stance"] == "CONFIRMS" else "negative" if item["stance"] == "CONFLICTS" else "amber"
+        title = item["title"].replace("<", "&lt;").replace(">", "&gt;")
+        source = item["source"].replace("<", "&lt;").replace(">", "&gt;")
+        title_html = f'<a href="{item["link"]}" target="_blank">{title}</a>' if item["link"] else title
+        st.markdown(f'<div class="panel" style="padding:10px 12px"><span class="{cls}"><b>{item["stance"]}</b></span> <span class="small">{source}</span><br>{title_html}<br><span class="small">{item["published"]}</span></div>', unsafe_allow_html=True)
 
 def header():
     label, confidence = regime()
@@ -306,6 +426,55 @@ def score_bar(score):
 def signal_class(action):
     return "positive" if action == "BUY" else "negative" if action == "SELL" else "muted"
 
+
+def render_currency_heatmap():
+    currencies_list = list(CURRENCIES)
+    values = [[0 if base == quote else round(currency_score(base) - currency_score(quote), 2) for quote in currencies_list] for base in currencies_list]
+    figure = go.Figure(go.Heatmap(
+        z=values,
+        x=currencies_list,
+        y=currencies_list,
+        colorscale=[[0, "#FF5263"], [.5, "#101720"], [1, "#2DD477"]],
+        zmid=0,
+        text=[[f"{value:+.2f}" for value in row] for row in values],
+        texttemplate="%{text}",
+        hovertemplate="%{y} vs %{x}: %{z:+.2f}<extra></extra>",
+    ))
+    figure.update_layout(height=430, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#F2F5F8", xaxis_title="Quote currency", yaxis_title="Base currency")
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def render_opportunity_matrix():
+    currencies_list = list(CURRENCIES)
+    values = [[None for _ in currencies_list] for _ in currencies_list]
+    labels = [["" for _ in currencies_list] for _ in currencies_list]
+    for analysis in analyses:
+        base, quote = pair_currencies(analysis.pair)
+        if base in currencies_list and quote in currencies_list:
+            row, column = currencies_list.index(base), currencies_list.index(quote)
+            values[row][column] = signed_pair_score(analysis)
+            labels[row][column] = f"{analysis.action} {analysis.score:.0f}"
+    figure = go.Figure(go.Heatmap(
+        z=values,
+        x=currencies_list,
+        y=currencies_list,
+        colorscale=[[0, "#FF5263"], [.5, "#101720"], [1, "#2DD477"]],
+        zmid=0,
+        zmin=-100,
+        zmax=100,
+        text=labels,
+        texttemplate="%{text}",
+        hovertemplate="%{y}%{x}: %{z:+.0f}<extra></extra>",
+    ))
+    figure.update_layout(height=430, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#F2F5F8", xaxis_title="Quote currency", yaxis_title="Base currency")
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def render_conviction_ranking():
+    ranked = sorted((analysis for analysis in analyses if analysis.action in ("BUY", "SELL")), key=lambda analysis: (analysis.confidence, analysis.score, analysis.alignment), reverse=True)[:10]
+    rows = [{"#": rank, "PAIR": analysis.pair, "ACTION": analysis.action, "SCORE": round(analysis.score), "CONFIDENCE": f"{analysis.confidence:.0f}%", "GRADE": analysis.grade, "ALIGNMENT": f"{analysis.alignment}/9"} for rank, analysis in enumerate(ranked, 1)]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 def overview():
     label, confidence = regime()
     section_header("MARKET STATE", "Risk regime", "Multi-asset context used to frame the FX signal engine.")
@@ -338,12 +507,15 @@ def overview():
             '</div>', unsafe_allow_html=True
         )
 
+    section_header("CURRENCY MAP", "Relative currency strength", "Positive cells indicate that the row currency has a stronger composite than the column currency.")
+    render_currency_heatmap()
+
     st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
 
     section_header("CURRENCY ENGINE", "Currency strength & repricing", "Aggregate structural, repricing and flow inputs. Positive values indicate relative strength.")
     cur_df = pd.DataFrame([
         {"CURRENCY":c,"STRUCTURAL":v["structural"],"REPRICING":v["repricing"],"FLOW":v["flow"],
-         "COT":"N/A","RETAIL":"N/A","FINAL":round(v["structural"]*.3+v["repricing"]*.7,2)}
+         "COT":"N/A","RETAIL":"N/A","FINAL":round(currency_score(c),2)}
         for c,v in currencies.items()
     ]).sort_values("FINAL", ascending=False)
 
@@ -402,6 +574,11 @@ def overview():
                      "CONF.": st.column_config.TextColumn("CONF."),
                  })
 
+    section_header("CONVICTION", "Signal ranking", "The strongest directional signals by confidence, score and model alignment.")
+    render_conviction_ranking()
+    section_header("OPPORTUNITY MATRIX", "BUY / SELL opportunity map", "Each cell represents the model action for the base and quote combination.")
+    render_opportunity_matrix()
+
 def scanner():
     section_header("MARKET SCANNER", "28-pair scanner", "Filter the model by action, confidence and currency exposure.")
     c1,c2,c3,c4 = st.columns([1.2,1.2,1.2,1.5])
@@ -420,65 +597,64 @@ def scanner():
         unsafe_allow_html=True
     )
     st.dataframe(df, use_container_width=True, hide_index=True)
-    if selected != "Select a pair": pair_xray(selected)
+    if selected != "Select a pair":
+        st.session_state.selected_pair = selected
+    if st.session_state.get("selected_pair"):
+        pair_xray(st.session_state.selected_pair)
 
 def pair_xray(pair):
-    a=next(x for x in analyses if x.pair==pair)
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-    section_header("PAIR X-RAY", pair, "Detailed model view: price response, drivers and factor contributions.")
-
+    analysis = next(item for item in analyses if item.pair == pair)
+    why = build_why_trade(analysis)
+    section_header("PAIR X-RAY", pair, "Detailed model view: thesis, contextual news, price response and factor contributions.")
     metrics = st.columns(5)
-    values = [("Action",a.action),("Score",f"{a.score:.0f}/100"),("Confidence",f"{a.confidence:.0f}%"),("Grade",a.grade),("Alignment",f"{a.alignment}/9")]
-    for col,(name,value) in zip(metrics,values):
-        with col:
-            cls = signal_class(a.action) if name=="Action" else ""
-            st.markdown(
-                f'<div class="panel" style="margin-bottom:0"><div class="small">{name}</div>'
-                f'<div class="{cls}" style="font-size:1.15rem;font-weight:800;margin-top:5px">{value}</div></div>',
-                unsafe_allow_html=True
-            )
+    values = [("Action", analysis.action), ("Score", f"{analysis.score:.0f}/100"), ("Confidence", f"{analysis.confidence:.0f}%"), ("Grade", analysis.grade), ("Alignment", f"{analysis.alignment}/9")]
+    for column, (name, value) in zip(metrics, values):
+        with column:
+            cls = signal_class(analysis.action) if name == "Action" else ""
+            st.markdown(f'<div class="panel" style="margin-bottom:0"><div class="small">{name}</div><div class="{cls}" style="font-size:1.15rem;font-weight:800;margin-top:5px">{value}</div></div>', unsafe_allow_html=True)
 
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-    left,right=st.columns([7,3])
-    with left:
-        history = yahoo_history(pair, period="1y") if provider_name == "YAHOO FINANCE" else pd.DataFrame()
-        if not history.empty and "Close" in history:
-            prices = history["Close"].astype(float).dropna().tail(252)
-            x = prices.index
-        else:
-            x=np.arange(120); base=market[pair]["price"]; prices=base*(1+np.cumsum(np.random.default_rng(sum(map(ord,pair))).normal(0,.002,120)))
-        fig=go.Figure()
-        fig.add_trace(go.Scatter(x=x,y=prices,mode="lines",line={"color":"#4DA3FF","width":2},name="Price"))
-        fig.add_trace(go.Scatter(x=x,y=pd.Series(prices).rolling(14).mean(),mode="lines",line={"color":"#F5B84B","width":1.5},name="14 SMA"))
-        fig.update_layout(
-            height=340, margin=dict(l=0,r=0,t=20,b=0),
-            paper_bgcolor="#101720", plot_bgcolor="#101720", font_color="#A6B1BD",
-            xaxis=dict(showgrid=False,zeroline=False), yaxis=dict(showgrid=True,gridcolor="#1D2935",zeroline=False),
-            legend=dict(orientation="h",y=1.08,x=0,font_size=11)
-        )
-        st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False})
-    with right:
-        cls = signal_class(a.action)
-        st.markdown(
-            f'<div class="panel" style="min-height:340px">'
-            f'<div class="small">Model verdict</div>'
-            f'<div class="{cls}" style="font-size:1.7rem;font-weight:800;margin:7px 0">{a.action}</div>'
-            f'{score_bar(a.score)}'
-            f'<div style="margin-top:15px;color:#C7D0D9;font-size:.8rem;line-height:1.7">'
-            f'<b>Why this pair?</b><br>{a.explanation}</div>'
-            f'<div class="divider"></div>'
-            f'<div class="small">Risk flag</div>'
-            f'<div class="amber" style="margin-top:5px;font-size:.78rem">Price contradiction risk must be monitored.</div>'
-            f'</div>',unsafe_allow_html=True
-        )
+    tab1, tab2, tab3 = st.tabs(["Why this trade?", "News radar", "Price & factors"])
+    with tab1:
+        left, right = st.columns([1.25, .75])
+        with left:
+            cls = signal_class(analysis.action)
+            st.markdown(f'<div class="panel"><div class="small">Model verdict</div><div class="{cls}" style="font-size:1.45rem;font-weight:800">{analysis.action} · {why["verdict"]}</div>{score_bar(analysis.confidence)}<div class="small">Signal confidence {analysis.confidence:.0f}%</div></div>', unsafe_allow_html=True)
+            st.markdown("#### Why the model is leaning this way")
+            for bullet in why["bullets"]:
+                st.markdown(f'<div class="panel" style="padding:10px 12px">✓ {bullet}</div>', unsafe_allow_html=True)
+        with right:
+            edge_cls = "positive" if why["edge"] > 0 else "negative"
+            st.markdown(f'<div class="panel"><div class="small">Currency battle</div><b>{why["base"]}</b> <span class="muted">{why["base_score"]:+.2f}</span> vs <b>{why["quote"]}</b> <span class="muted">{why["quote_score"]:+.2f}</span><div class="{edge_cls}" style="font-size:1.5rem;font-weight:800;margin-top:12px">Edge {why["edge"]:+.2f}</div><div class="small">{why["base"]} minus {why["quote"]} composite strength</div></div>', unsafe_allow_html=True)
+            st.markdown("#### Model alignment")
+            for name, value, status in factor_rows(analysis)[:6]:
+                cls = "positive" if status == "CONFIRMS" else "negative" if status == "CONFLICTS" else "muted"
+                st.markdown(f'<div class="panel" style="padding:9px 11px"><span class="{cls}">{status}</span> · {name} <b>{value:+.2f}</b></div>', unsafe_allow_html=True)
 
-    section_header("SIGNAL DECOMPOSITION", "Factor contribution", "What is confirming, conflicting or remaining neutral.")
-    factor_df=pd.DataFrame([
-        {"FACTOR":k.upper(),"CONTRIBUTION":f"{v:+.2f}","STATUS":"CONFIRMS" if v>.25 else "CONFLICTS" if v<-.25 else "NEUTRAL"}
-        for k,v in a.factors.items()
-    ])
-    st.dataframe(factor_df,use_container_width=True,hide_index=True)
-    st.info("Core rule: rate levels are not treated as directional signals. Repricing, yield driver, surprise, flow, cross-asset confirmation, and price response must agree before a trade is considered.", icon=":material/gavel:")
+    with tab2:
+        render_news(analysis)
+
+    with tab3:
+        left, right = st.columns([7, 3])
+        with left:
+            history = yahoo_history(pair, period="1y") if provider_name == "YAHOO FINANCE" else pd.DataFrame()
+            if not history.empty and "Close" in history:
+                prices = history["Close"].astype(float).dropna().tail(252)
+                x = prices.index
+            else:
+                x = np.arange(120)
+                base = market[pair]["price"]
+                prices = base * (1 + np.cumsum(np.random.default_rng(sum(map(ord, pair))).normal(0, .002, 120)))
+            figure = go.Figure()
+            figure.add_trace(go.Scatter(x=x, y=prices, mode="lines", line={"color": "#4DA3FF", "width": 2}, name="Price"))
+            figure.add_trace(go.Scatter(x=x, y=pd.Series(prices).rolling(14).mean(), mode="lines", line={"color": "#F5B84B", "width": 1.5}, name="14 SMA"))
+            figure.update_layout(height=340, margin=dict(l=0, r=0, t=20, b=0), paper_bgcolor="#101720", plot_bgcolor="#101720", font_color="#A6B1BD", xaxis=dict(showgrid=False, zeroline=False), yaxis=dict(showgrid=True, gridcolor="#1D2935", zeroline=False), legend=dict(orientation="h", y=1.08, x=0, font_size=11))
+            st.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False})
+        with right:
+            st.markdown(f'<div class="panel" style="min-height:340px"><div class="small">Net driver</div><div class="big">{analysis.score:.0f}/100</div><hr><div>{analysis.explanation}</div></div>', unsafe_allow_html=True)
+        section_header("SIGNAL DECOMPOSITION", "Factor contribution", "What is confirming, conflicting or remaining neutral.")
+        factor_df = pd.DataFrame([{"FACTOR": name.upper(), "CONTRIBUTION": value, "STATUS": status} for name, value, status in factor_rows(analysis)])
+        st.dataframe(factor_df, use_container_width=True, hide_index=True)
+        st.info("Core rule: rate levels are not treated as directional signals. Repricing, yield driver, surprise, flow, cross-asset confirmation, and price response must agree before a trade is considered.", icon=":material/gavel:")
 
 def generic_page(page):
     page_labels = {"Yield Dashboard": "Yield dashboard", "Economic Calendar": "Economic calendar", "COT & Positioning": "COT & positioning", "Risk Regime": "Risk regime", "Technical Scanner": "Technical scanner", "Currency Matrix": "Currency matrix", "Catalyst Radar": "Catalyst radar", "Top Setups": "Top setups", "Correlations": "Correlations", "Performance": "Performance", "Settings": "Settings"}
