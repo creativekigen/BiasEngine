@@ -288,6 +288,7 @@ def fetch_pair_news(pair, action, max_age_days=7):
     pair_text = pair.lower()
     base_terms = CURRENCY_TERMS.get(base, [base.lower()])
     quote_terms = CURRENCY_TERMS.get(quote, [quote.lower()])
+    currency_terms = {base: base_terms, quote: quote_terms}
     items = []
     seen_links = set()
 
@@ -312,8 +313,8 @@ def fetch_pair_news(pair, action, max_age_days=7):
             searchable = f"{title} {description}".lower()
             compact_searchable = searchable.replace("/", "").replace("-", "")
             pair_match = pair_text in compact_searchable.replace("/", "").replace("-", "")
-            currency_match = any(term in searchable for term in base_terms) and any(term in searchable for term in quote_terms)
-            if not pair_match and not currency_match:
+            matched_currencies = [currency for currency, terms in currency_terms.items() if any(term in searchable for term in terms)]
+            if not pair_match and not matched_currencies:
                 continue
             positive = sum(term in searchable for term in ["bullish", "higher", "strengthen", "gains", "rises", "support", "buy", "hawkish", "surge"])
             negative = sum(term in searchable for term in ["bearish", "lower", "weaken", "falls", "drops", "sell", "dovish", "decline"])
@@ -322,7 +323,9 @@ def fetch_pair_news(pair, action, max_age_days=7):
                 stance = "CONFIRMS" if positive > negative else "CONFLICTS" if negative > positive else "MIXED"
             elif action == "SELL":
                 stance = "CONFIRMS" if negative > positive else "CONFLICTS" if positive > negative else "MIXED"
-            items.append({"title": title, "link": link, "source": source_name, "published": published, "published_at": published_at, "stance": stance})
+            if pair_match and not matched_currencies:
+                matched_currencies = [base, quote]
+            items.append({"title": title, "link": link, "source": source_name, "published": published, "published_at": published_at, "stance": stance, "currencies": matched_currencies})
             seen_links.add(link)
 
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -335,7 +338,9 @@ def fetch_pair_news(pair, action, max_age_days=7):
             continue
 
     for source_name, domain in NEWS_SOURCE_DOMAINS.items():
-        query = quote_plus(f"site:{domain} ({pair} OR {base} {quote} forex) when:{max_age_days}d")
+        base_query = " OR ".join([base] + base_terms)
+        quote_query = " OR ".join([quote] + quote_terms)
+        query = quote_plus(f"site:{domain} ({pair} OR ({base_query}) OR ({quote_query})) forex when:{max_age_days}d")
         feed_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
         try:
             response = requests.get(feed_url, timeout=8, headers=headers)
@@ -349,7 +354,8 @@ def fetch_pair_news(pair, action, max_age_days=7):
 
 def render_news(analysis):
     st.markdown("#### Bias-aware news radar")
-    st.caption(f"Relevant coverage for {analysis.pair} from the last 7 days, ranked by publication time and currency match.")
+    base, quote = pair_currencies(analysis.pair)
+    st.caption(f"Most recent coverage for either {base} or {quote} from the last 7 days, ranked by publication time.")
     items = fetch_pair_news(analysis.pair, analysis.action)
     if not items:
         st.info(f"No recent relevant articles were found for {analysis.pair}.")
@@ -357,8 +363,9 @@ def render_news(analysis):
         cls = "positive" if item["stance"] == "CONFIRMS" else "negative" if item["stance"] == "CONFLICTS" else "amber"
         title = escape(item["title"])
         source = escape(item["source"])
+        currencies = escape(" / ".join(item["currencies"]))
         title_html = f'<a href="{item["link"]}" target="_blank">{title}</a>' if item["link"] else title
-        st.markdown(f'<div class="panel" style="padding:10px 12px"><span class="{cls}"><b>{item["stance"]}</b></span> <span class="small">{source}</span><br>{title_html}<br><span class="small">{item["published"]}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="panel" style="padding:10px 12px"><span class="{cls}"><b>{item["stance"]}</b></span> <span class="small">{currencies} · {source}</span><br>{title_html}<br><span class="small">{item["published"]}</span></div>', unsafe_allow_html=True)
 
 def header():
     label, confidence = regime()
