@@ -1,8 +1,9 @@
 """BIASFLO institutional-style FX market intelligence terminal."""
 from __future__ import annotations
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from html import escape
 from pathlib import Path
 from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
@@ -200,12 +201,26 @@ def regime():
     return label, max(51, min(88, int(64 + score * 8)))
 
 
-SOURCE_WATCHLIST = {
-    "Reuters": "https://www.reuters.com/",
-    "CNBC": "https://www.cnbc.com/2026/09/07/japan-foreign-reserves-yen-intervention.html",
-    "The Japan Times": "https://www.japantimes.co.jp/business/2026/09/07/markets/japan-treasuries-sell-for-yen/",
-    "Forex Factory": "https://www.forexfactory.com/news/1416690-yen-climbs-to-highest-level-since-may-exceeding",
-    "FXStreet": "https://www.fxstreet.com/analysis/jpy-pairs-selling-resumes-usd-jpy-152-eur-jpy-178-and-gbp-jpy-207-next-video-202609070907",
+NEWS_SOURCE_FEEDS = {
+    "CNBC": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "The Japan Times": "https://www.japantimes.co.jp/feed/topstories/",
+    "FXStreet": "https://www.fxstreet.com/rss/news",
+}
+
+NEWS_SOURCE_DOMAINS = {
+    "Reuters": "reuters.com",
+    "Forex Factory": "forexfactory.com",
+}
+
+CURRENCY_TERMS = {
+    "USD": ["usd", "dollar", "us dollar", "united states"],
+    "EUR": ["eur", "euro", "eurozone"],
+    "GBP": ["gbp", "pound", "sterling", "uk"],
+    "JPY": ["jpy", "yen", "japanese", "japan"],
+    "CHF": ["chf", "franc", "swiss"],
+    "CAD": ["cad", "canadian", "loonie"],
+    "AUD": ["aud", "australian", "aussie"],
+    "NZD": ["nzd", "new zealand", "kiwi"],
 }
 
 
@@ -269,21 +284,24 @@ def build_why_trade(analysis):
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_pair_news(pair, action, max_age_days=7):
     base, quote = pair_currencies(pair)
-    query = quote_plus(f"({pair} OR {base} {quote} forex) when:{max_age_days}d")
-    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-    try:
-        response = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-        root = ET.fromstring(response.text)
-        cutoff = datetime.now(timezone.utc) - pd.Timedelta(days=max_age_days)
-        items = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    pair_text = pair.lower()
+    base_terms = CURRENCY_TERMS.get(base, [base.lower()])
+    quote_terms = CURRENCY_TERMS.get(quote, [quote.lower()])
+    items = []
+    seen_links = set()
+
+    def add_feed_items(xml_text, source_name):
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            return
         for item in root.findall(".//item"):
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
-            source_node = item.find("source")
-            source = (source_node.text or "Unknown") if source_node is not None else "Unknown"
-            published = (item.findtext("pubDate") or "").strip()
-            if not title or not link:
+            published = (item.findtext("pubDate") or item.findtext("published") or "").strip()
+            description = (item.findtext("description") or "").strip()
+            if not title or not link or link in seen_links:
                 continue
             try:
                 published_at = parsedate_to_datetime(published).astimezone(timezone.utc)
@@ -291,39 +309,56 @@ def fetch_pair_news(pair, action, max_age_days=7):
                 continue
             if published_at < cutoff:
                 continue
-            lower_title = title.lower()
-            positive = sum(term in lower_title for term in ["bullish", "higher", "strengthen", "gains", "rises", "support", "buy", "hawkish", "surge"])
-            negative = sum(term in lower_title for term in ["bearish", "lower", "weaken", "falls", "drops", "sell", "dovish", "decline"])
+            searchable = f"{title} {description}".lower()
+            compact_searchable = searchable.replace("/", "").replace("-", "")
+            pair_match = pair_text in compact_searchable.replace("/", "").replace("-", "")
+            currency_match = any(term in searchable for term in base_terms) and any(term in searchable for term in quote_terms)
+            if not pair_match and not currency_match:
+                continue
+            positive = sum(term in searchable for term in ["bullish", "higher", "strengthen", "gains", "rises", "support", "buy", "hawkish", "surge"])
+            negative = sum(term in searchable for term in ["bearish", "lower", "weaken", "falls", "drops", "sell", "dovish", "decline"])
+            stance = "MIXED"
             if action == "BUY":
                 stance = "CONFIRMS" if positive > negative else "CONFLICTS" if negative > positive else "MIXED"
             elif action == "SELL":
                 stance = "CONFIRMS" if negative > positive else "CONFLICTS" if positive > negative else "MIXED"
-            else:
-                stance = "MIXED"
-            items.append({"title": title, "link": link, "source": source, "published": published, "published_at": published_at, "stance": stance})
-        return sorted(items, key=lambda item: item["published_at"], reverse=True)[:15]
-    except (requests.RequestException, ET.ParseError) as error:
-        return [{"title": "News feed unavailable", "link": "", "source": "System", "published": "", "stance": "MIXED", "error": str(error)}]
+            items.append({"title": title, "link": link, "source": source_name, "published": published, "published_at": published_at, "stance": stance})
+            seen_links.add(link)
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for source_name, feed_url in NEWS_SOURCE_FEEDS.items():
+        try:
+            response = requests.get(feed_url, timeout=8, headers=headers)
+            response.raise_for_status()
+            add_feed_items(response.text, source_name)
+        except (requests.RequestException, ET.ParseError):
+            continue
+
+    for source_name, domain in NEWS_SOURCE_DOMAINS.items():
+        query = quote_plus(f"site:{domain} ({pair} OR {base} {quote} forex) when:{max_age_days}d")
+        feed_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+        try:
+            response = requests.get(feed_url, timeout=8, headers=headers)
+            response.raise_for_status()
+            add_feed_items(response.text, source_name)
+        except (requests.RequestException, ET.ParseError):
+            continue
+
+    return sorted(items, key=lambda item: item["published_at"], reverse=True)[:15]
 
 
 def render_news(analysis):
     st.markdown("#### Bias-aware news radar")
-    st.caption("News is contextual evidence. Showing dated items from the last 7 days; the engine does not force every article to agree with the model signal.")
-    base, quote = pair_currencies(analysis.pair)
+    st.caption(f"Relevant coverage for {analysis.pair} from the last 7 days, ranked by publication time and currency match.")
     items = fetch_pair_news(analysis.pair, analysis.action)
     if not items:
-        st.info("No dated articles were found in the last 7 days for this pair.")
+        st.info(f"No recent relevant articles were found for {analysis.pair}.")
     for item in items[:8]:
         cls = "positive" if item["stance"] == "CONFIRMS" else "negative" if item["stance"] == "CONFLICTS" else "amber"
-        title = item["title"].replace("<", "&lt;").replace(">", "&gt;")
-        source = item["source"].replace("<", "&lt;").replace(">", "&gt;")
+        title = escape(item["title"])
+        source = escape(item["source"])
         title_html = f'<a href="{item["link"]}" target="_blank">{title}</a>' if item["link"] else title
         st.markdown(f'<div class="panel" style="padding:10px 12px"><span class="{cls}"><b>{item["stance"]}</b></span> <span class="small">{source}</span><br>{title_html}<br><span class="small">{item["published"]}</span></div>', unsafe_allow_html=True)
-    if quote == "JPY" or base == "JPY":
-        st.markdown("#### Additional source coverage")
-        st.caption("These outlets are included as direct research links. Their pages are not treated as fresh RSS items until a dated article is confirmed.")
-        for source, link in SOURCE_WATCHLIST.items():
-            st.markdown(f'<div class="panel" style="padding:9px 11px"><a href="{link}" target="_blank"><b>{source}</b></a></div>', unsafe_allow_html=True)
 
 def header():
     label, confidence = regime()
