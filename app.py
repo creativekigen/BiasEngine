@@ -2,6 +2,7 @@
 from __future__ import annotations
 import sys
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
@@ -199,13 +200,11 @@ def regime():
     return label, max(51, min(88, int(64 + score * 8)))
 
 
-FEATURED_NEWS = {
-    "JPY": {
-        "title": "JPY pairs selling resumes - USD/JPY 152, EUR/JPY 178 and GBP/JPY 207 next?",
-        "url": "https://www.fxstreet.com/analysis/jpy-pairs-selling-resumes-usd-jpy-152-eur-jpy-178-and-gbp-jpy-207-next-video-202609070907",
-        "source": "FXStreet",
-        "note": "Use this as a JPY-cross context article, not as proof of every JPY pair's direction.",
-    }
+SOURCE_WATCHLIST = {
+    "Reuters": "https://www.reuters.com/",
+    "CNBC": "https://www.cnbc.com/2026/09/07/japan-foreign-reserves-yen-intervention.html",
+    "The Japan Times": "https://www.japantimes.co.jp/business/2026/09/07/markets/japan-treasuries-sell-for-yen/",
+    "Forex Factory": "https://www.forexfactory.com/news/1416690-yen-climbs-to-highest-level-since-may-exceeding",
 }
 
 
@@ -267,22 +266,29 @@ def build_why_trade(analysis):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_pair_news(pair, action):
+def fetch_pair_news(pair, action, max_age_days=7):
     base, quote = pair_currencies(pair)
-    query = quote_plus(f"{pair} OR {base} {quote} forex")
+    query = quote_plus(f"({pair} OR {base} {quote} forex) when:{max_age_days}d")
     url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
     try:
         response = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
         root = ET.fromstring(response.text)
+        cutoff = datetime.now(timezone.utc) - pd.Timedelta(days=max_age_days)
         items = []
-        for item in root.findall(".//item")[:15]:
+        for item in root.findall(".//item"):
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
             source_node = item.find("source")
             source = (source_node.text or "Unknown") if source_node is not None else "Unknown"
             published = (item.findtext("pubDate") or "").strip()
             if not title or not link:
+                continue
+            try:
+                published_at = parsedate_to_datetime(published).astimezone(timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if published_at < cutoff:
                 continue
             lower_title = title.lower()
             positive = sum(term in lower_title for term in ["bullish", "higher", "strengthen", "gains", "rises", "support", "buy", "hawkish", "surge"])
@@ -293,25 +299,30 @@ def fetch_pair_news(pair, action):
                 stance = "CONFIRMS" if negative > positive else "CONFLICTS" if positive > negative else "MIXED"
             else:
                 stance = "MIXED"
-            items.append({"title": title, "link": link, "source": source, "published": published, "stance": stance})
-        return items
+            items.append({"title": title, "link": link, "source": source, "published": published, "published_at": published_at, "stance": stance})
+        return sorted(items, key=lambda item: item["published_at"], reverse=True)[:15]
     except (requests.RequestException, ET.ParseError) as error:
         return [{"title": "News feed unavailable", "link": "", "source": "System", "published": "", "stance": "MIXED", "error": str(error)}]
 
 
 def render_news(analysis):
     st.markdown("#### Bias-aware news radar")
-    st.caption("News is contextual evidence. The engine does not force every article to agree with the model signal.")
+    st.caption("News is contextual evidence. Showing dated items from the last 7 days; the engine does not force every article to agree with the model signal.")
     base, quote = pair_currencies(analysis.pair)
-    if quote == "JPY" or base == "JPY":
-        featured = FEATURED_NEWS["JPY"]
-        st.markdown(f'<div class="panel"><b>Featured JPY-cross context</b><br><a href="{featured["url"]}" target="_blank">{featured["title"]}</a><br><span class="small">{featured["source"]} · {featured["note"]}</span></div>', unsafe_allow_html=True)
-    for item in fetch_pair_news(analysis.pair, analysis.action)[:8]:
+    items = fetch_pair_news(analysis.pair, analysis.action)
+    if not items:
+        st.info("No dated articles were found in the last 7 days for this pair.")
+    for item in items[:8]:
         cls = "positive" if item["stance"] == "CONFIRMS" else "negative" if item["stance"] == "CONFLICTS" else "amber"
         title = item["title"].replace("<", "&lt;").replace(">", "&gt;")
         source = item["source"].replace("<", "&lt;").replace(">", "&gt;")
         title_html = f'<a href="{item["link"]}" target="_blank">{title}</a>' if item["link"] else title
         st.markdown(f'<div class="panel" style="padding:10px 12px"><span class="{cls}"><b>{item["stance"]}</b></span> <span class="small">{source}</span><br>{title_html}<br><span class="small">{item["published"]}</span></div>', unsafe_allow_html=True)
+    if quote == "JPY" or base == "JPY":
+        st.markdown("#### Additional source coverage")
+        st.caption("These outlets are included as direct research links. Their pages are not treated as fresh RSS items until a dated article is confirmed.")
+        for source, link in SOURCE_WATCHLIST.items():
+            st.markdown(f'<div class="panel" style="padding:9px 11px"><a href="{link}" target="_blank"><b>{source}</b></a></div>', unsafe_allow_html=True)
 
 def header():
     label, confidence = regime()
